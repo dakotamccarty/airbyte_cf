@@ -19,6 +19,10 @@ import io.airbyte.config.persistence.DatabaseConfigPersistence;
 import io.airbyte.config.persistence.split_secrets.JsonSecretsProcessor;
 import io.airbyte.config.persistence.split_secrets.SecretPersistence;
 import io.airbyte.db.Database;
+import io.airbyte.db.factory.DSLContextFactory;
+import io.airbyte.db.factory.DataSourceFactory;
+import io.airbyte.db.factory.DatabaseDriver;
+import io.airbyte.db.factory.FlywayFactory;
 import io.airbyte.db.instance.DatabaseMigrator;
 import io.airbyte.db.instance.configs.ConfigsDatabaseInstance;
 import io.airbyte.db.instance.configs.ConfigsDatabaseMigrator;
@@ -30,6 +34,10 @@ import io.airbyte.validation.json.JsonValidationException;
 import java.io.IOException;
 import java.util.Optional;
 import java.util.UUID;
+import javax.sql.DataSource;
+import org.flywaydb.core.Flyway;
+import org.jooq.DSLContext;
+import org.jooq.SQLDialect;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,6 +57,7 @@ public class BootloaderApp {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(BootloaderApp.class);
   private static final AirbyteVersion VERSION_BREAK = new AirbyteVersion("0.32.0-alpha");
+  private static final String DRIVER_CLASS_NAME = DatabaseDriver.POSTGRESQL.getDriverClassName();
 
   private final Configs configs;
   private final Runnable postLoadExecution;
@@ -116,9 +125,7 @@ public class BootloaderApp {
   public void load() throws Exception {
     LOGGER.info("Setting up config database and default workspace..");
 
-    try (
-
-        final Database jobDatabase =
+    try (final Database jobDatabase =
             new JobsDatabaseInstance(configs.getDatabaseUser(), configs.getDatabasePassword(), configs.getDatabaseUrl()).getAndInitialize()) {
       LOGGER.info("Created initial jobs and configs database...");
 
@@ -126,7 +133,17 @@ public class BootloaderApp {
       final AirbyteVersion currAirbyteVersion = configs.getAirbyteVersion();
       assertNonBreakingMigration(jobPersistence, currAirbyteVersion);
 
-      runFlywayMigration(configs, configDatabase, jobDatabase);
+      // TODO Will be converted to an injected singleton during DI migration
+      final Flyway configsFlyway = FlywayFactory.create(configsDataSource, BootloaderApp.class.getSimpleName(), ConfigsDatabaseMigrator.DB_IDENTIFIER,
+          ConfigsDatabaseMigrator.MIGRATION_FILE_LOCATION);
+      final Flyway jobsFlyway = FlywayFactory.create(jobsDataSource, BootloaderApp.class.getSimpleName(), JobsDatabaseMigrator.DB_IDENTIFIER,
+          JobsDatabaseMigrator.MIGRATION_FILE_LOCATION);
+
+      // TODO Will be converted to an injected singleton during DI migration
+      final DatabaseMigrator configDbMigrator = new ConfigsDatabaseMigrator(configDatabase, configsFlyway);
+      final DatabaseMigrator jobDbMigrator = new JobsDatabaseMigrator(jobDatabase, jobsFlyway);
+
+      runFlywayMigration(configs, configDbMigrator, jobDbMigrator);
       LOGGER.info("Ran Flyway migrations...");
 
       final ConfigRepository configRepository =
@@ -167,8 +184,20 @@ public class BootloaderApp {
   }
 
   public static void main(final String[] args) throws Exception {
-    final var bootloader = new BootloaderApp();
+    final Configs configs = new EnvConfigs();
+
+    // Manual configuration that will be replaced by Dependency Injection in the future
+    final DataSource configsDataSource = DataSourceFactory.create(configs.getConfigDatabaseUser(), configs.getConfigDatabasePassword(),
+        DRIVER_CLASS_NAME, configs.getConfigDatabaseUrl());
+    final DSLContext configsDslContext = DSLContextFactory.create(configsDataSource, SQLDialect.POSTGRES);
+    final DataSource jobsDataSource =
+        DataSourceFactory.create(configs.getDatabaseUser(), configs.getDatabasePassword(), DRIVER_CLASS_NAME, configs.getDatabaseUrl());
+    final DSLContext jobsDslContext = DSLContextFactory.create(jobsDataSource, SQLDialect.POSTGRES);
+
+    final var bootloader = new BootloaderApp(configs, configsDataSource, configsDslContext, jobsDataSource, jobsDslContext);
     bootloader.load();
+
+    Runtime.getRuntime().addShutdownHook(new Thread(() -> bootloader.shutdown()));
   }
 
   private static void createDeploymentIfNoneExists(final JobPersistence jobPersistence) throws IOException {
@@ -235,10 +264,7 @@ public class BootloaderApp {
     return !isUpgradingThroughVersionBreak;
   }
 
-  private static void runFlywayMigration(final Configs configs, final Database configDatabase, final Database jobDatabase) {
-    final DatabaseMigrator configDbMigrator = new ConfigsDatabaseMigrator(configDatabase, BootloaderApp.class.getSimpleName());
-    final DatabaseMigrator jobDbMigrator = new JobsDatabaseMigrator(jobDatabase, BootloaderApp.class.getSimpleName());
-
+  private static void runFlywayMigration(final Configs configs, final DatabaseMigrator configDbMigrator, final DatabaseMigrator jobDbMigrator) {
     configDbMigrator.createBaseline();
     jobDbMigrator.createBaseline();
 
