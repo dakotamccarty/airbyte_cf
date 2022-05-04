@@ -78,6 +78,7 @@ public class BootloaderApp {
    *
    * @param configs
    * @param postLoadExecution
+   * @param featureFlags
    */
   public BootloaderApp(final Configs configs,
                        final Runnable postLoadExecution,
@@ -129,35 +130,34 @@ public class BootloaderApp {
             new JobsDatabaseInstance(configs.getDatabaseUser(), configs.getDatabasePassword(), configs.getDatabaseUrl()).getAndInitialize()) {
       LOGGER.info("Created initial jobs and configs database...");
 
-      final JobPersistence jobPersistence = new DefaultJobPersistence(jobDatabase);
-      final AirbyteVersion currAirbyteVersion = configs.getAirbyteVersion();
-      assertNonBreakingMigration(jobPersistence, currAirbyteVersion);
+    final JobPersistence jobPersistence = new DefaultJobPersistence(jobDatabase);
+    final AirbyteVersion currAirbyteVersion = configs.getAirbyteVersion();
+    assertNonBreakingMigration(jobPersistence, currAirbyteVersion);
 
-      // TODO Will be converted to an injected singleton during DI migration
-      final Flyway configsFlyway = FlywayFactory.create(configsDataSource, BootloaderApp.class.getSimpleName(), ConfigsDatabaseMigrator.DB_IDENTIFIER,
-          ConfigsDatabaseMigrator.MIGRATION_FILE_LOCATION);
-      final Flyway jobsFlyway = FlywayFactory.create(jobsDataSource, BootloaderApp.class.getSimpleName(), JobsDatabaseMigrator.DB_IDENTIFIER,
-          JobsDatabaseMigrator.MIGRATION_FILE_LOCATION);
+    // TODO Will be converted to an injected singleton during DI migration
+    final Flyway configsFlyway = FlywayFactory.create(configsDataSource, BootloaderApp.class.getSimpleName(), ConfigsDatabaseMigrator.DB_IDENTIFIER,
+        ConfigsDatabaseMigrator.MIGRATION_FILE_LOCATION);
+    final Flyway jobsFlyway = FlywayFactory.create(jobsDataSource, BootloaderApp.class.getSimpleName(), JobsDatabaseMigrator.DB_IDENTIFIER,
+        JobsDatabaseMigrator.MIGRATION_FILE_LOCATION);
 
-      // TODO Will be converted to an injected singleton during DI migration
-      final DatabaseMigrator configDbMigrator = new ConfigsDatabaseMigrator(configDatabase, configsFlyway);
-      final DatabaseMigrator jobDbMigrator = new JobsDatabaseMigrator(jobDatabase, jobsFlyway);
+    // TODO Will be converted to an injected singleton during DI migration
+    final DatabaseMigrator configDbMigrator = new ConfigsDatabaseMigrator(configDatabase, configsFlyway);
+    final DatabaseMigrator jobDbMigrator = new JobsDatabaseMigrator(jobDatabase, jobsFlyway);
 
-      runFlywayMigration(configs, configDbMigrator, jobDbMigrator);
-      LOGGER.info("Ran Flyway migrations...");
+    runFlywayMigration(configs, configDbMigrator, jobDbMigrator);
+    LOGGER.info("Ran Flyway migrations...");
 
       final ConfigRepository configRepository =
           new ConfigRepository(configPersistence, configDatabase);
 
-      createWorkspaceIfNoneExists(configRepository);
-      LOGGER.info("Default workspace created..");
+    createWorkspaceIfNoneExists(configRepository);
+    LOGGER.info("Default workspace created..");
 
-      createDeploymentIfNoneExists(jobPersistence);
-      LOGGER.info("Default deployment created..");
+    createDeploymentIfNoneExists(jobPersistence);
+    LOGGER.info("Default deployment created..");
 
-      jobPersistence.setVersion(currAirbyteVersion.serialize());
-      LOGGER.info("Set version to {}", currAirbyteVersion);
-    }
+    jobPersistence.setVersion(currAirbyteVersion.serialize());
+    LOGGER.info("Set version to {}", currAirbyteVersion);
 
     postLoadExecution.run();
     LOGGER.info("Finished running post load Execution..");
@@ -189,15 +189,22 @@ public class BootloaderApp {
     // Manual configuration that will be replaced by Dependency Injection in the future
     final DataSource configsDataSource = DataSourceFactory.create(configs.getConfigDatabaseUser(), configs.getConfigDatabasePassword(),
         DRIVER_CLASS_NAME, configs.getConfigDatabaseUrl());
-    final DSLContext configsDslContext = DSLContextFactory.create(configsDataSource, SQLDialect.POSTGRES);
     final DataSource jobsDataSource =
         DataSourceFactory.create(configs.getDatabaseUser(), configs.getDatabasePassword(), DRIVER_CLASS_NAME, configs.getDatabaseUrl());
-    final DSLContext jobsDslContext = DSLContextFactory.create(jobsDataSource, SQLDialect.POSTGRES);
 
-    final var bootloader = new BootloaderApp(configs, configsDataSource, configsDslContext, jobsDataSource, jobsDslContext);
-    bootloader.load();
+    try (final DSLContext jobsDslContext = DSLContextFactory.create(jobsDataSource, SQLDialect.POSTGRES);
+        final DSLContext configsDslContext = DSLContextFactory.create(configsDataSource, SQLDialect.POSTGRES)) {
 
-    Runtime.getRuntime().addShutdownHook(new Thread(() -> bootloader.shutdown()));
+      Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        configsDslContext.close();
+        jobsDslContext.close();
+        closeDataSource(configsDataSource);
+        closeDataSource(jobsDataSource);
+      }));
+
+      final var bootloader = new BootloaderApp(configs, configsDataSource, configsDslContext, jobsDataSource, jobsDslContext);
+      bootloader.load();
+    }
   }
 
   private static void createDeploymentIfNoneExists(final JobPersistence jobPersistence) throws IOException {

@@ -42,6 +42,7 @@ import io.airbyte.scheduler.models.JobWithStatusAndTimestamp;
 import io.airbyte.test.utils.DatabaseConnectionHelper;
 import io.airbyte.validation.json.JsonSchemaValidator;
 import io.airbyte.validation.json.JsonValidationException;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.sql.SQLException;
@@ -102,9 +103,10 @@ class DefaultJobPersistenceTest {
 
   private static PostgreSQLContainer<?> container;
   private Database jobDatabase;
-  private Database configDatabase;
   private Supplier<Instant> timeSupplier;
   private JobPersistence jobPersistence;
+  private DataSource dataSource;
+  private DSLContext dslContext;
 
   @BeforeAll
   public static void dbSetup() {
@@ -172,8 +174,8 @@ class DefaultJobPersistenceTest {
   @SuppressWarnings("unchecked")
   @BeforeEach
   public void setup() throws Exception {
-    final DataSource dataSource = DatabaseConnectionHelper.createDataSource(container);
-    final DSLContext dslContext = DSLContextFactory.create(dataSource, SQLDialect.POSTGRES);
+    dataSource = DatabaseConnectionHelper.createDataSource(container);
+    dslContext = DSLContextFactory.create(dataSource, SQLDialect.POSTGRES);
     final TestDatabaseProviders databaseProviders = new TestDatabaseProviders(dataSource, dslContext);
     jobDatabase = databaseProviders.createNewJobsDatabase();
     resetDb();
@@ -186,8 +188,11 @@ class DefaultJobPersistenceTest {
   }
 
   @AfterEach
-  void tearDown() throws Exception {
-    jobDatabase.close();
+  void tearDown() throws IOException {
+    dslContext.close();
+    if (dataSource instanceof Closeable closeable) {
+      closeable.close();
+    }
   }
 
   private void resetDb() throws SQLException {
