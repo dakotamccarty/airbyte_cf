@@ -31,6 +31,7 @@ import io.airbyte.db.instance.jobs.JobsDatabaseMigrator;
 import io.airbyte.scheduler.persistence.DefaultJobPersistence;
 import io.airbyte.scheduler.persistence.JobPersistence;
 import io.airbyte.validation.json.JsonValidationException;
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.Optional;
 import java.util.UUID;
@@ -67,8 +68,11 @@ public class BootloaderApp {
   private Database configDatabase;
 
   @VisibleForTesting
-  public BootloaderApp(final Configs configs, final FeatureFlags featureFlags, final SecretMigrator secretMigrator) {
-    this(configs, () -> {}, featureFlags, secretMigrator);
+  public BootloaderApp(final Configs configs,
+                       final FeatureFlags featureFlags,
+                       final SecretMigrator secretMigrator,
+                       final DSLContext configsDslContext) {
+    this(configs, () -> {}, featureFlags, secretMigrator, configsDslContext);
   }
 
   /**
@@ -78,27 +82,27 @@ public class BootloaderApp {
    *
    * @param configs
    * @param postLoadExecution
-   * @param featureFlags
    */
   public BootloaderApp(final Configs configs,
                        final Runnable postLoadExecution,
                        final FeatureFlags featureFlags,
-                       final SecretMigrator secretMigrator) {
+                       final SecretMigrator secretMigrator,
+                       final DSLContext configsDslContext) {
     this.configs = configs;
     this.postLoadExecution = postLoadExecution;
     this.featureFlags = featureFlags;
     this.secretMigrator = secretMigrator;
 
-    initPersistences();
+    initPersistences(configsDslContext);
   }
 
-  public BootloaderApp(final Configs configs, final FeatureFlags featureFlags) {
+  public BootloaderApp(final Configs configs, final FeatureFlags featureFlags, final DSLContext configsDslContext) {
     this.configs = configs;
     this.featureFlags = featureFlags;
 
     try {
-      initPersistences();
-      final Optional<SecretPersistence> secretPersistence = SecretPersistence.getLongLived(configs);
+      initPersistences(configsDslContext);
+      final Optional<SecretPersistence> secretPersistence = SecretPersistence.getLongLived(configsDslContext, configs);
       secretMigrator = new SecretMigrator(configPersistence, secretPersistence);
 
       postLoadExecution = () -> {
@@ -119,16 +123,11 @@ public class BootloaderApp {
     }
   }
 
-  public BootloaderApp() {
-    this(new EnvConfigs(), new EnvVariableFeatureFlags());
-  }
-
-  public void load() throws Exception {
+  public void load(final DataSource configsDataSource, final DataSource jobsDataSource, final DSLContext jobsDslContext) throws Exception {
     LOGGER.info("Setting up config database and default workspace..");
 
-    try (final Database jobDatabase =
-            new JobsDatabaseInstance(configs.getDatabaseUser(), configs.getDatabasePassword(), configs.getDatabaseUrl()).getAndInitialize()) {
-      LOGGER.info("Created initial jobs and configs database...");
+    final Database jobDatabase = new JobsDatabaseInstance(jobsDslContext).getAndInitialize();
+    LOGGER.info("Created initial jobs and configs database...");
 
     final JobPersistence jobPersistence = new DefaultJobPersistence(jobDatabase);
     final AirbyteVersion currAirbyteVersion = configs.getAirbyteVersion();
@@ -145,10 +144,9 @@ public class BootloaderApp {
     final DatabaseMigrator jobDbMigrator = new JobsDatabaseMigrator(jobDatabase, jobsFlyway);
 
     runFlywayMigration(configs, configDbMigrator, jobDbMigrator);
-    LOGGER.info("Ran Flyway migrations...");
 
-      final ConfigRepository configRepository =
-          new ConfigRepository(configPersistence, configDatabase);
+    final ConfigRepository configRepository =
+        new ConfigRepository(configPersistence, configDatabase);
 
     createWorkspaceIfNoneExists(configRepository);
     LOGGER.info("Default workspace created..");
@@ -165,12 +163,9 @@ public class BootloaderApp {
     LOGGER.info("Finished bootstrapping Airbyte environment..");
   }
 
-  private void initPersistences() {
+  private void initPersistences(final DSLContext configsDslContext) {
     try {
-      configDatabase = new ConfigsDatabaseInstance(
-          configs.getConfigDatabaseUser(),
-          configs.getConfigDatabasePassword(),
-          configs.getConfigDatabaseUrl()).getAndInitialize();
+      configDatabase = new ConfigsDatabaseInstance(configsDslContext).getAndInitialize();
 
       final JsonSecretsProcessor jsonSecretsProcessor = JsonSecretsProcessor.builder()
           .maskSecrets(true)
@@ -179,12 +174,13 @@ public class BootloaderApp {
 
       configPersistence = DatabaseConfigPersistence.createWithValidation(configDatabase, jsonSecretsProcessor);
     } catch (final IOException e) {
-      e.printStackTrace();
+      LOGGER.error("Unable to initialize persistence.", e);
     }
   }
 
   public static void main(final String[] args) throws Exception {
     final Configs configs = new EnvConfigs();
+    final FeatureFlags featureFlags = new EnvVariableFeatureFlags();
 
     // Manual configuration that will be replaced by Dependency Injection in the future
     final DataSource configsDataSource = DataSourceFactory.create(configs.getConfigDatabaseUser(), configs.getConfigDatabasePassword(),
@@ -192,8 +188,8 @@ public class BootloaderApp {
     final DataSource jobsDataSource =
         DataSourceFactory.create(configs.getDatabaseUser(), configs.getDatabasePassword(), DRIVER_CLASS_NAME, configs.getDatabaseUrl());
 
-    try (final DSLContext jobsDslContext = DSLContextFactory.create(jobsDataSource, SQLDialect.POSTGRES);
-        final DSLContext configsDslContext = DSLContextFactory.create(configsDataSource, SQLDialect.POSTGRES)) {
+    try (final DSLContext configsDslContext = DSLContextFactory.create(configsDataSource, SQLDialect.POSTGRES);
+        final DSLContext jobsDslContext = DSLContextFactory.create(configsDataSource, SQLDialect.POSTGRES)) {
 
       Runtime.getRuntime().addShutdownHook(new Thread(() -> {
         configsDslContext.close();
@@ -202,8 +198,18 @@ public class BootloaderApp {
         closeDataSource(jobsDataSource);
       }));
 
-      final var bootloader = new BootloaderApp(configs, configsDataSource, configsDslContext, jobsDataSource, jobsDslContext);
-      bootloader.load();
+      final var bootloader = new BootloaderApp(configs, featureFlags, configsDslContext);
+      bootloader.load(configsDataSource, jobsDataSource, jobsDslContext);
+    }
+  }
+
+  private static void closeDataSource(final DataSource dataSource) {
+    if (dataSource != null && dataSource instanceof Closeable closeable) {
+      try {
+        closeable.close();
+      } catch (final IOException e) {
+        LOGGER.error("Unable to close data source.", e);
+      }
     }
   }
 
