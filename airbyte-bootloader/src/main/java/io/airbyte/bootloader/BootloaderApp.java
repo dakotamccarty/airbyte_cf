@@ -82,6 +82,9 @@ public class BootloaderApp {
    *
    * @param configs
    * @param postLoadExecution
+   * @param featureFlags
+   * @param secretMigrator
+   * @param configsDslContext
    */
   public BootloaderApp(final Configs configs,
                        final Runnable postLoadExecution,
