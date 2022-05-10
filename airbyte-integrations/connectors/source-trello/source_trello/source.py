@@ -88,7 +88,7 @@ class Boards(TrelloStream):
     """
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
-        return "members/me/boards"
+        return "organizations/5200a10a30c4ea0e530016ca/boards"
 
     def parse_response(self, response: requests.Response, **kwargs) -> Iterable[Mapping]:
         board_ids = self.config.get("board_ids", [])
